@@ -1,0 +1,3 @@
+﻿Deney Adı,Toplam Test,Seçilen Test,Elenen Test,Başlangıç Süresi (sn),Optimize Süre (sn),Süre Tasarrufu (%),Özellik Kapsamı (%),Gereksiz Tekrar,Çözüm Süresi (sn)
+10 Testlik E-Ticaret Paketi,10,3,7,285,75,%73.68,%100.0 (5/5),0,0.172
+500 Testlik Endüstriyel Paket,500,64,436,30952,3344,%89.2,%100.0 (30/30),247,1.472

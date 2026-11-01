@@ -1,262 +1,330 @@
+from __future__ import annotations
+
+import csv
 import os
 import time
+
+import matplotlib
+
+matplotlib.use("Agg")  # Sunucu / VS Code ortaminda engelleyici pencere acma.
 import matplotlib.pyplot as plt
 import numpy as np
 
 from bmgo import binary_mountain_gazelle_optimizer
-from data_generator import generate_synthetic_data, get_sample_ecommerce_data
-from fitness import prioritize_tests_and_calculate_apfd
+from baselines import genetic_algorithm_optimizer, greedy_regression_selector
+from data_generator import generate_telecom_data
+from fitness import get_suite_metrics, prioritize_tests_and_calculate_apfd
 
 
-def print_suite_metrics(
-    title,
-    solution,
-    coverage_matrix,
-    durations,
-    test_names,
-    apfd_score,
-    ordered_suite,
-    dependency_matrix,
-):
-    """Terminal için detaylı, okunaklı ve tüm metrikleri içeren raporu basar."""
-    selected_indices = np.where(solution == 1)[0]
-    total_tests = len(durations)
-    selected_count = len(selected_indices)
-
-    initial_duration = int(np.sum(durations))
-    optimized_duration = int(np.sum(durations[selected_indices]))
-    saved_time = initial_duration - optimized_duration
-    time_reduction_pct = (saved_time / initial_duration) * 100
-
-    # Kapsam hesaplama
-    feature_counts = np.dot(solution, coverage_matrix)
-    total_features = coverage_matrix.shape[1]
-    covered_features = int(np.sum(feature_counts > 0))
-    coverage_pct = (covered_features / total_features) * 100
-
-    # Tekrar hesaplama
-    redundancy_count = int(np.sum(np.maximum(0, feature_counts - 1)))
-
-    # Kopuk Bağımlılık (Broken Dependency) Kontrolü
-    broken_dep_count = 0
-    if dependency_matrix is not None:
-        for i in selected_indices:
-            required_parents = np.where(dependency_matrix[:, i] == 1)[0]
-            for p in required_parents:
-                if solution[p] == 0:
-                    broken_dep_count += 1
-
-    print(f"\n{'='*65}")
-    print(f" {title}")
-    print(f"{'='*65}")
-    print(f"Toplam Test Sayısı          : {total_tests}")
-    print(f"Seçilen Test Sayısı         : {selected_count} (Elendi: {total_tests - selected_count})")
-    print(f"Başlangıç Koşum Süresi      : {initial_duration} sn")
-    print(f"Optimize Koşum Süresi       : {optimized_duration} sn")
-    print(f"Süre Tasarrufu Oranı        : %{time_reduction_pct:.2f}")
-    print(f"Gereksinim/Hata Kapsamı     : %{coverage_pct:.2f} ({covered_features}/{total_features})")
-    print(f"Gereksiz Tekrar Sayısı      : {redundancy_count}")
-    print(f"Kopuk Bağımlılık Sayısı     : {broken_dep_count} (İhlal Edilen Ön Koşul)")
-    print(f"Fail-Fast Erken Yakalama    : %{apfd_score:.2f} (APFD Skoru)")
-
-    if total_tests <= 10:
-        print("\nÖnceliklendirilmiş Çalıştırma Sırası (CI/CD Pipeline Planı):")
-        for order, idx in enumerate(ordered_suite, 1):
-            print(f"  {order}. Sıra -> {test_names[idx]} ({durations[idx]} sn)")
-    print(f"{'='*65}\n")
+SIZES = (50, 100, 250, 500, 1000)
+OPTIMIZER_SEEDS = (42, 43, 44)
+DATA_SEED = 42  # Adil karsilastirma icin her boyutta sabit veri kaynagi.
+POP_SIZE = 12
+MAX_ITER = 20
+MIN_COVERAGE = 0.90
+OUTPUT_DIR = "sonuclar"
+GA_GENERATIONS = MAX_ITER * 4  # BMGO ile esit fitness degerlendirme sayisi.
 
 
-def save_table_as_image(results_data, output_filepath):
-    """Tüm yeni metrikleri içeren şık bir PNG tablo görseli oluşturur."""
-    fig, ax = plt.subplots(figsize=(15, 3.5))
-    ax.axis("tight")
-    ax.axis("off")
+def early_critical_coverage(order, coverage, critical, fraction=0.25):
+    """Ilk %25 testte gorulen kritik kurallar. APFD *degildir*."""
+    if len(order) == 0 or len(critical) == 0:
+        return 0.0
+    first_count = max(1, int(np.ceil(len(order) * fraction)))
+    hits = np.any(coverage[order[:first_count]][:, critical] != 0, axis=0)
+    return float(100.0 * np.mean(hits))
 
-    columns = [
-        "Deney Adı",
-        "Toplam",
-        "Seçilen",
-        "Elenen",
-        "İlk Süre",
-        "Opt. Süre",
-        "Tasarruf",
-        "Kapsam",
-        "Tekrar",
-        "Kopuk Ön Koşul",
-        "APFD",
-        "Çözüm Süresi",
-    ]
 
-    table = ax.table(
-        cellText=results_data,
-        colLabels=columns,
-        loc="center",
-        cellLoc="center",
-    )
-    table.auto_set_font_size(False)
-    table.set_fontsize(10)
-    table.scale(1.15, 2.3)
+def write_case_table(path, cases):
+    """Senaryolari Excel'de okunabilecek UTF-8 CSV olarak kaydeder."""
+    if not cases:
+        return
+    with open(path, "w", newline="", encoding="utf-8-sig") as file:
+        writer = csv.DictWriter(file, fieldnames=cases[0].keys(), delimiter=";")
+        writer.writeheader()
+        for case in cases:
+            writer.writerow({
+                key: " | ".join(map(str, value)) if isinstance(value, (list, tuple)) else value
+                for key, value in case.items()
+            })
 
-    for (row, col), cell in table.get_celld().items():
-        if row == 0:
-            cell.set_facecolor("#1B263B")
-            cell.set_text_props(color="white", weight="bold")
-        else:
-            cell.set_facecolor("#F8F9FA" if row % 2 == 0 else "#FFFFFF")
 
-    plt.savefig(output_filepath, bbox_inches="tight", dpi=300)
-    plt.close()
+def make_comparison_row(algorithm, n, seed, solution, fitness_value, elapsed,
+                        coverage, durations, dependencies, critical, evaluations):
+    """Bütün yöntemleri aynı metriklerle değerlendirir ve denetler."""
+    m = get_suite_metrics(solution, coverage, durations, dependencies, critical)
+    if (m["critical_missing"] != 0 or m["broken_dependencies"] != 0
+            or m["coverage_ratio"] + 1e-9 < MIN_COVERAGE):
+        raise RuntimeError(f"{algorithm} gecersiz cozum: {n} test, seed={seed}")
+    return {
+        "algoritma": algorithm,
+        "test_sayisi": n,
+        "seed": seed,
+        "gereksinim_sayisi": m["total_features"],
+        "secili_test": m["selected_count"],
+        "sure_tasarrufu_yuzde": round(100 * (1 - m["time_ratio"]), 2),
+        "genel_kapsam_yuzde": round(100 * m["coverage_ratio"], 2),
+        "kritik_kapsam_yuzde": round(100 * (1 - m["critical_missing"] / m["critical_total"]), 2),
+        "kopuk_on_kosul": m["broken_dependencies"],
+        "fitness": round(float(fitness_value), 6),
+        "algoritma_suresi_sn": round(elapsed, 4),
+        "fitness_degerlendirmesi": evaluations,
+    }
 
 
 def run_experiment():
-    print("Yapay Zekâ Destekli Test Orkestrasyonu Başlatılıyor (BMGO)...\n")
-    output_dir = "sonuclar"
-    os.makedirs(output_dir, exist_ok=True)
-    table_rows = []
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    rows = []
+    comparison_rows = []
+    representative_curves = {}
+    curves_1000 = {}
 
-    # ==========================================
-    # DENEY 1: 10 Testlik E-Ticaret Örneği
-    # ==========================================
-    cov_10, dur_10, names_10, _, dep_10 = get_sample_ecommerce_data()
+    print("\nBMGO - TELEKOM REGRESYON TEST SECIMI VE ONCELIKLENDIRME")
+    print("Kural: kritik %100, genel en az %90; on kosullar korunur.")
+    print("NOT: Veriler kurgusaldir; hata tespit matrisi yoksa APFD hesaplanmaz.\n")
+    print(f"BMGO ve GA es aday butcesi: {POP_SIZE * (1 + 4 * MAX_ITER)} fitness hesaplamasi.\n")
 
-    start_time = time.time()
-    best_sol_10, best_fit_10, curve_10 = binary_mountain_gazelle_optimizer(
-        coverage_matrix=cov_10,
-        durations=dur_10,
-        dependency_matrix=dep_10,
-        pop_size=25,
-        max_iter=40,
-        random_seed=42,
-    )
-    time_10 = time.time() - start_time
+    for n in SIZES:
+        coverage, durations, names, features, deps, metadata = generate_telecom_data(
+            num_tests=n, seed=DATA_SEED, include_metadata=True
+        )
+        critical = metadata["critical_feature_indices"]
+        if n == 50:
+            write_case_table(
+                os.path.join(OUTPUT_DIR, "telekom_50_ornek_senaryo.csv"),
+                metadata["test_cases"],
+            )
 
-    order_10, apfd_10 = prioritize_tests_and_calculate_apfd(best_sol_10, cov_10, dur_10)
+        for run_seed in OPTIMIZER_SEEDS:
+            start = time.perf_counter()
+            solution, fitness_value, convergence = binary_mountain_gazelle_optimizer(
+                coverage_matrix=coverage,
+                durations=durations,
+                dependency_matrix=deps,
+                critical_feature_indices=critical,
+                min_coverage=MIN_COVERAGE,
+                pop_size=POP_SIZE,
+                max_iter=MAX_ITER,
+                w_time=0.4,
+                w_count=0.4,
+                w_redundancy=0.2,
+                random_seed=run_seed,
+            )
+            elapsed = time.perf_counter() - start
+            metrics = get_suite_metrics(solution, coverage, durations, deps, critical)
 
-    print_suite_metrics(
-        "DENEY 1: 10 Testlik E-Ticaret Regresyon Paketi",
-        best_sol_10,
-        cov_10,
-        dur_10,
-        names_10,
-        apfd_10,
-        order_10,
-        dep_10,
-    )
-    print(f"Deney 1 Çözüm Süresi: {time_10:.3f} saniye")
+            if (metrics["critical_missing"] != 0
+                    or metrics["coverage_ratio"] < MIN_COVERAGE - 1e-9
+                    or metrics["broken_dependencies"] != 0):
+                raise RuntimeError(f"Gecersiz BMGO cozumu: {n} test, seed={run_seed}")
 
-    # Tablo satırı hesabı (Deney 1)
-    sel_10 = int(np.sum(best_sol_10))
-    time_save_10 = ((np.sum(dur_10) - np.sum(dur_10[best_sol_10 == 1])) / np.sum(dur_10)) * 100
-    feat_10 = np.dot(best_sol_10, cov_10)
-    red_10 = int(np.sum(np.maximum(0, feat_10 - 1)))
-    broken_10 = sum(
-        1 for i in np.where(best_sol_10 == 1)[0]
-        for p in np.where(dep_10[:, i] == 1)[0] if best_sol_10[p] == 0
-    )
+            order, apfd = prioritize_tests_and_calculate_apfd(
+                solution, coverage, durations,
+                dependency_matrix=deps,
+                critical_feature_indices=critical,
+            )
+            early_coverage = early_critical_coverage(order, coverage, critical)
 
-    table_rows.append([
-        "10 Testlik Paket",
-        len(dur_10),
-        sel_10,
-        len(dur_10) - sel_10,
-        f"{int(np.sum(dur_10))}s",
-        f"{int(np.sum(dur_10[best_sol_10 == 1]))}s",
-        f"%{time_save_10:.1f}",
-        f"%100.0 ({np.sum(feat_10 > 0)}/5)",
-        red_10,
-        f"{broken_10} adet",
-        f"%{apfd_10:.1f}",
-        f"{time_10:.2f}s",
-    ])
+            result = {
+                "test_sayisi": n,
+                "seed": run_seed,
+                "gereksinim_sayisi": len(features),
+                "kritik_gereksinim_sayisi": len(critical),
+                "yeni_is_kurali_sayisi": metadata["additional_rule_count"],
+                "baglamsal_kapsam_sayisi": metadata["context_rule_count"],
+                "secili_test": metrics["selected_count"],
+                "elenen_test": n - metrics["selected_count"],
+                "toplam_sure_sn": round(metrics["total_duration"], 2),
+                "optimize_sure_sn": round(metrics["selected_duration"], 2),
+                "sure_tasarrufu_yuzde": round(100 * (1 - metrics["time_ratio"]), 2),
+                "genel_kapsam_yuzde": round(100 * metrics["coverage_ratio"], 2),
+                "kritik_kapsam_yuzde": round(
+                    100 * (1 - metrics["critical_missing"] / metrics["critical_total"]), 2
+                ),
+                "kopuk_on_kosul": metrics["broken_dependencies"],
+                "gereksiz_kapsama_tekrari": metrics["redundant_hits"],
+                "ilk_ceyrek_kritik_kural_kapsami_yuzde": round(early_coverage, 2),
+                "APFD": "VERI_YOK" if apfd is None else round(apfd, 2),
+                "fitness": round(fitness_value, 6),
+                "algoritma_suresi_sn": round(elapsed, 4),
+            }
+            rows.append(result)
+            comparison_rows.append(make_comparison_row(
+                "BMGO", n, run_seed, solution, fitness_value, elapsed,
+                coverage, durations, deps, critical,
+                POP_SIZE * (1 + 4 * MAX_ITER),
+            ))
 
-    # ==========================================
-    # DENEY 2: 500 Testlik Büyük Ölçekli Paket
-    # ==========================================
-    print("\n500 Testlik Sentetik Paket Üretiliyor ve Optimize Ediliyor...")
-    cov_500, dur_500, names_500, _, dep_500 = generate_synthetic_data(
-        num_tests=500, num_features=30, seed=42
-    )
+            print(
+                f"{n:4} test | {len(features):3} kapsam hedefi | seed={run_seed} "
+                f"| secilen={metrics['selected_count']:3} "
+                f"| kapsam=%{100 * metrics['coverage_ratio']:.1f} "
+                f"| kritik=%100 | tasarruf=%{100 * (1 - metrics['time_ratio']):.1f} "
+                f"| ihlal={metrics['broken_dependencies']} | {elapsed:.2f} sn"
+            )
 
-    start_time = time.time()
-    best_sol_500, best_fit_500, curve_500 = binary_mountain_gazelle_optimizer(
-        coverage_matrix=cov_500,
-        durations=dur_500,
-        pop_size=40,
-        max_iter=80,
-        w_time=0.4,
-        w_redundancy=0.6,
-        random_seed=42,
-    )
-    time_500 = time.time() - start_time
+            if run_seed == OPTIMIZER_SEEDS[0]:
+                representative_curves[n] = convergence
+                if n == 1000:
+                    curves_1000["BMGO"] = convergence
+                write_case_table(
+                    os.path.join(OUTPUT_DIR, f"telekom_{n}_secili_testler.csv"),
+                    [
+                        {"oncelik_sirasi": rank, **metadata["test_cases"][int(idx)]}
+                        for rank, idx in enumerate(order, 1)
+                    ],
+                )
+                print("  Ilk 5 oncelikli test:")
+                for test_idx in order[:5]:
+                    print(f"    T_{test_idx + 1:04d} - {names[test_idx]}")
 
-    order_500, apfd_500 = prioritize_tests_and_calculate_apfd(best_sol_500, cov_500, dur_500)
+        # Greedy deterministiktir; bir kez calistirmak yeterli.
+        start = time.perf_counter()
+        greedy_sol, greedy_fit = greedy_regression_selector(
+            coverage, durations, deps, critical_feature_indices=critical,
+            min_coverage=MIN_COVERAGE,
+        )
+        greedy_elapsed = time.perf_counter() - start
+        comparison_rows.append(make_comparison_row(
+            "Greedy", n, "tek", greedy_sol, greedy_fit, greedy_elapsed,
+            coverage, durations, deps, critical, "tek-gecis",
+        ))
 
-    print_suite_metrics(
-        "DENEY 2: 500 Testlik Endüstriyel Ölçekli Paket",
-        best_sol_500,
-        cov_500,
-        dur_500,
-        names_500,
-        apfd_500,
-        order_500,
-        dep_500,
-    )
-    print(f"Deney 2 Çözüm Süresi: {time_500:.3f} saniye")
+        # GA da BMGO ile esit (P + 4 * iter * P) aday degerlendirir.
+        for run_seed in OPTIMIZER_SEEDS:
+            start = time.perf_counter()
+            ga_sol, ga_fit, ga_curve = genetic_algorithm_optimizer(
+                coverage_matrix=coverage,
+                durations=durations,
+                dependency_matrix=deps,
+                pop_size=POP_SIZE,
+                max_generations=GA_GENERATIONS,
+                random_seed=run_seed,
+                critical_feature_indices=critical,
+                min_coverage=MIN_COVERAGE,
+            )
+            ga_elapsed = time.perf_counter() - start
+            ga_result = make_comparison_row(
+                "GA", n, run_seed, ga_sol, ga_fit, ga_elapsed,
+                coverage, durations, deps, critical,
+                POP_SIZE * (1 + GA_GENERATIONS),
+            )
+            comparison_rows.append(ga_result)
+            if n == 1000 and run_seed == OPTIMIZER_SEEDS[0]:
+                curves_1000["GA"] = ga_curve
+            print(
+                f"  GA  | {n:4} test | seed={run_seed} "
+                f"| secilen={ga_result['secili_test']:3} "
+                f"| tasarruf=%{ga_result['sure_tasarrufu_yuzde']:.1f} "
+                f"| fitness={ga_fit:.4f} | {ga_elapsed:.2f} sn"
+            )
+        print(f"  Greedy | {n:4} test | fitness={greedy_fit:.4f} | {greedy_elapsed:.2f} sn\n")
 
-    # Tablo satırı hesabı (Deney 2)
-    sel_500 = int(np.sum(best_sol_500))
-    time_save_500 = ((np.sum(dur_500) - np.sum(dur_500[best_sol_500 == 1])) / np.sum(dur_500)) * 100
-    feat_500 = np.dot(best_sol_500, cov_500)
-    red_500 = int(np.sum(np.maximum(0, feat_500 - 1)))
-    broken_500 = sum(
-        1 for i in np.where(best_sol_500 == 1)[0]
-        for p in np.where(dep_500[:, i] == 1)[0] if best_sol_500[p] == 0
-    )
+    csv_path = os.path.join(OUTPUT_DIR, "telekom_bmgo_denemeler.csv")
+    with open(csv_path, "w", newline="", encoding="utf-8-sig") as file:
+        writer = csv.DictWriter(file, fieldnames=list(rows[0].keys()), delimiter=";")
+        writer.writeheader()
+        writer.writerows(rows)
 
-    table_rows.append([
-        "500 Testlik Paket",
-        len(dur_500),
-        sel_500,
-        len(dur_500) - sel_500,
-        f"{int(np.sum(dur_500))}s",
-        f"{int(np.sum(dur_500[best_sol_500 == 1]))}s",
-        f"%{time_save_500:.1f}",
-        f"%100.0 ({np.sum(feat_500 > 0)}/30)",
-        red_500,
-        f"{broken_500} adet",
-        f"%{apfd_500:.1f}",
-        f"{time_500:.2f}s",
-    ])
+    fig, ax = plt.subplots(figsize=(10, 6))
+    for n, curve in representative_curves.items():
+        ax.plot(np.arange(1, len(curve) + 1), curve, label=f"{n} test")
+    ax.set_title("BMGO Yakinsama Grafigi - Telekom Testleri")
+    ax.set_xlabel("Iterasyon")
+    ax.set_ylabel("Fitness (dusuk daha iyi)")
+    ax.legend()
+    ax.grid(alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(os.path.join(OUTPUT_DIR, "bmgo_yakinsama.png"), dpi=200)
+    plt.close(fig)
 
-    # ==========================================
-    # 3. YENİ TABLOYU PNG OLARAK KAYDETME
-    # ==========================================
-    table_path = os.path.join(output_dir, "sonuclar_tablosu.png")
-    save_table_as_image(table_rows, table_path)
-    print(f"Genişletilmiş Tablo PNG kaydedildi: -> {table_path}")
+    grouped = {
+        n: [r["sure_tasarrufu_yuzde"] for r in rows if r["test_sayisi"] == n]
+        for n in SIZES
+    }
+    means = [np.mean(grouped[n]) for n in SIZES]
+    stds = [np.std(grouped[n], ddof=1) for n in SIZES]
+    fig, ax = plt.subplots(figsize=(10, 5))
+    ax.errorbar(SIZES, means, yerr=stds, marker="o", capsize=4)
+    ax.set_title("Test Paketi Boyutuna Gore Sure Tasarrufu (3 Kosum)")
+    ax.set_xlabel("Baslangictaki test sayisi")
+    ax.set_ylabel("Ortalama sure tasarrufu (%)")
+    ax.set_ylim(0, 105)
+    ax.grid(alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(os.path.join(OUTPUT_DIR, "bmgo_sure_tasarrufu.png"), dpi=200)
+    plt.close(fig)
 
-    # ==========================================
-    # 4. YAKINSAMA GRAFİKLERİNİ KAYDETME
-    # ==========================================
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+    print(f"\nCSV: {csv_path}")
+    print(f"Senaryo tablolari: {OUTPUT_DIR}/telekom_50_ornek_senaryo.csv ve secili testler")
+    print(f"Grafikler: {OUTPUT_DIR}/bmgo_yakinsama.png, {OUTPUT_DIR}/bmgo_sure_tasarrufu.png")
 
-    ax1.plot(curve_10, color="#1D3557", linewidth=2, marker="o", markersize=4)
-    ax1.set_title("10 Testlik Paket Yakınsama Eğrisi")
-    ax1.set_xlabel("İterasyon")
-    ax1.set_ylabel("Fitness Değeri")
-    ax1.grid(True, linestyle="--", alpha=0.6)
+    comparison_path = os.path.join(OUTPUT_DIR, "algoritma_karsilastirma.csv")
+    with open(comparison_path, "w", newline="", encoding="utf-8-sig") as file:
+        writer = csv.DictWriter(file, fieldnames=list(comparison_rows[0].keys()), delimiter=";")
+        writer.writeheader()
+        writer.writerows(comparison_rows)
 
-    ax2.plot(curve_500, color="#E63946", linewidth=2)
-    ax2.set_title("500 Testlik Paket Yakınsama Eğrisi")
-    ax2.set_xlabel("İterasyon")
-    ax2.set_ylabel("Fitness Değeri")
-    ax2.grid(True, linestyle="--", alpha=0.6)
+    algorithm_names = ("Greedy", "GA", "BMGO")
+    x = np.arange(len(SIZES))
+    fig, ax = plt.subplots(figsize=(11, 6))
+    for idx, name in enumerate(algorithm_names):
+        means = [
+            np.mean([r["sure_tasarrufu_yuzde"] for r in comparison_rows
+                     if r["algoritma"] == name and r["test_sayisi"] == n])
+            for n in SIZES
+        ]
+        ax.bar(x + (idx - 1) * 0.25, means, width=0.25, label=name)
+    ax.set_xticks(x, [str(n) for n in SIZES])
+    ax.set_xlabel("Test sayisi")
+    ax.set_ylabel("Ortalama sure tasarrufu (%)")
+    ax.set_ylim(0, 105)
+    ax.set_title("Greedy - GA - BMGO Karsilastirmasi")
+    ax.legend()
+    ax.grid(axis="y", alpha=0.2)
+    fig.tight_layout()
+    fig.savefig(os.path.join(OUTPUT_DIR, "algoritma_karsilastirma.png"), dpi=200)
+    plt.close(fig)
 
-    plt.tight_layout()
-    chart_path = os.path.join(output_dir, "convergence_results.png")
-    plt.savefig(chart_path, dpi=300)
-    print(f"Yakınsama Grafiği kaydedildi: -> {chart_path}")
-    plt.show()
+    # Her veri boyutunda ayni fitness tanimi vardir, ancak boyutlar arasi
+    # mutlak fitness degerlerini basari siralamasi gibi okumamak gerekir.
+    fig, ax = plt.subplots(figsize=(11, 6))
+    for idx, name in enumerate(algorithm_names):
+        means = [
+            np.mean([r["fitness"] for r in comparison_rows
+                     if r["algoritma"] == name and r["test_sayisi"] == n])
+            for n in SIZES
+        ]
+        ax.bar(x + (idx - 1) * 0.25, means, width=0.25, label=name)
+    ax.set_xticks(x, [str(n) for n in SIZES])
+    ax.set_xlabel("Test sayisi")
+    ax.set_ylabel("Ortalama fitness (dusuk daha iyi)")
+    ax.set_title("Ayni Veri Boyutunda Fitness Karsilastirmasi")
+    ax.legend()
+    ax.grid(axis="y", alpha=0.2)
+    fig.tight_layout()
+    fig.savefig(os.path.join(OUTPUT_DIR, "algoritma_fitness_karsilastirma.png"), dpi=200)
+    plt.close(fig)
+
+    fig, ax = plt.subplots(figsize=(11, 6))
+    for name in ("BMGO", "GA"):
+        curve = curves_1000[name]
+        evaluations = POP_SIZE + np.arange(1, len(curve) + 1) * (
+            POP_SIZE * 4 if name == "BMGO" else POP_SIZE
+        )
+        ax.plot(evaluations, curve, label=name)
+    ax.set_xlabel("Degerlendirilen aday sayisi")
+    ax.set_ylabel("En iyi fitness (dusuk daha iyi)")
+    ax.set_title("1000 Testte Es Aday Butcesiyle Yakinsama")
+    ax.legend()
+    ax.grid(alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(os.path.join(OUTPUT_DIR, "bmgo_ga_es_butce_yakinsama.png"), dpi=200)
+    plt.close(fig)
+
+    print(f"\nKarsilastirma CSV: {comparison_path}")
+    print("Karsilastirma grafikleri: algoritma_karsilastirma.png, "
+          "algoritma_fitness_karsilastirma.png, bmgo_ga_es_butce_yakinsama.png")
 
 
 if __name__ == "__main__":
